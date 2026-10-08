@@ -16,25 +16,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Whether a command gets a process group of its own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Isolation {
-    /// For a command no terminal delivers Ctrl-C to: one running under a raw
-    /// mode screen, where Ctrl-C arrives as a key press and not as a signal.
-    /// `terminate_running_commands` can then take the whole group, so no
-    /// helper of a killed command keeps working.
-    OwnGroup,
-    /// For a command a terminal is watching in cooked mode, so that Ctrl-C
-    /// still reaches it.
-    SharedGroup,
-}
-
-/// Process ids of the commands running in a process group of their own right
-/// now. Only the commands of a plain run stay off it, in this process's own
-/// group. Quitting would otherwise leave them behind: nothing signals a group
-/// of its own, and the thread that waits for it dies with this process. A
-/// group stays listed while any process in it lives, so a process a command
-/// left behind is on it after the command itself has ended.
+/// Process ids of the running commands. Every command gets a process group of
+/// its own, so that a stop can take it together with the helpers it started,
+/// and that group is listed here so that a stop can find it: nothing else
+/// signals a group of its own, and the thread that waits for it dies with this
+/// process. A group stays listed while any process in it lives, so a process a
+/// command left behind is on it after the command itself has ended.
 static RUNNING_COMMANDS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
 /// Set while a run is being abandoned, so that the workers stop taking jobs.
@@ -277,15 +264,10 @@ fn own_process_group(command: &mut Command) {
 #[cfg(windows)]
 fn own_process_group(_command: &mut Command) {}
 
-/// Kills the command. One given a group of its own is killed by group, so the
-/// helpers it started go with it. One sharing this process's group is killed on
-/// its own: its pid names no group, and signalling the group it is really in
-/// would take parun down with it.
+/// Kills the command by group, so the helpers it started go with it.
 #[cfg(unix)]
-fn kill_command(child: &mut Child, isolation: Isolation) {
-    if matches!(isolation, Isolation::OwnGroup) {
-        signal_process_group(child.id(), Signal::Kill);
-    }
+fn kill_command(child: &mut Child) {
+    signal_process_group(child.id(), Signal::Kill);
     let _ = child.kill();
 }
 
@@ -320,7 +302,7 @@ fn signal_process_group(pid: u32, signal: Signal) {
 /// taken down by `taskkill` instead, forcibly in either case: there is no
 /// interruption a console-less process would receive.
 #[cfg(windows)]
-fn kill_command(child: &mut Child, _isolation: Isolation) {
+fn kill_command(child: &mut Child) {
     signal_process_group(child.id(), Signal::Kill);
     let _ = child.kill();
 }
@@ -393,9 +375,9 @@ fn spawn_tracked_counted(command: &mut Command) -> Result<Child> {
     let mut child = command.spawn().context("failed to run command")?;
     lock_ignoring_poison(&RUNNING_COMMANDS).push(child.id());
     if abandoned() {
-        kill_command(&mut child, Isolation::OwnGroup);
+        kill_command(&mut child);
         reap(&mut child);
-        forget_running(&child, Isolation::OwnGroup);
+        forget_running(&child);
         return Err(anyhow!("aborted before the command started"));
     }
     Ok(child)
@@ -410,28 +392,17 @@ pub struct CommandOutput {
 }
 
 /// Runs the command, handing each line it writes to `on_line` as it arrives.
-/// A command given a group of its own is killed by a stop together with the
-/// helpers it started; one sharing this process's group is left to the
-/// terminal's Ctrl-C.
+/// The command runs in a process group of its own and is listed while it runs,
+/// so a stop kills it together with the helpers it started.
 pub fn run_streaming(
     mut command: Command,
-    isolation: Isolation,
     on_line: &mut dyn FnMut(String),
 ) -> Result<CommandOutput> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // A command sharing this process's group is not tracked, but an abort
-    // still means that nothing new may start: a stop is under way, and the
-    // signal the terminal sent to the group has already gone by.
-    if abandoned() {
-        return Err(anyhow!("aborted before the command started"));
-    }
-    let mut child = match isolation {
-        Isolation::OwnGroup => spawn_tracked(command)?,
-        Isolation::SharedGroup => command.spawn().context("failed to run command")?,
-    };
+    let mut child = spawn_tracked(command)?;
     let (tx, rx) = mpsc::sync_channel(PIPE_QUEUE);
     let readers = stream(
         child.stdout.take().expect("stdout is piped above"),
@@ -439,9 +410,9 @@ pub fn run_streaming(
     )
     .and_then(|()| stream(child.stderr.take().expect("stderr is piped above"), tx));
     if let Err(error) = readers {
-        kill_command(&mut child, isolation);
+        kill_command(&mut child);
         reap(&mut child);
-        forget_running(&child, isolation);
+        forget_running(&child);
         return Err(error);
     }
 
@@ -478,14 +449,14 @@ pub fn run_streaming(
         if exited.is_none() {
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    forget_running(&child, isolation);
+                    forget_running(&child);
                     exited = Some((status, Instant::now() + DRAIN_TIMEOUT));
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    kill_command(&mut child, isolation);
+                    kill_command(&mut child);
                     reap(&mut child);
-                    forget_running(&child, isolation);
+                    forget_running(&child);
                     return Err(error).context("failed to wait for command");
                 }
             }
@@ -509,10 +480,7 @@ pub fn run_streaming(
 /// while a group with that id exists, so a kept entry names the right
 /// processes.
 #[cfg(unix)]
-fn forget_running(child: &Child, isolation: Isolation) {
-    if matches!(isolation, Isolation::SharedGroup) {
-        return;
-    }
+fn forget_running(child: &Child) {
     let pid = child.id();
     // Onto the leftover list before it leaves the running list, so that at no
     // moment is a live group on neither: a stop that looked between the two
@@ -557,10 +525,7 @@ fn group_alive(pid: u32) -> bool {
 }
 
 #[cfg(windows)]
-fn forget_running(child: &Child, isolation: Isolation) {
-    if matches!(isolation, Isolation::SharedGroup) {
-        return;
-    }
+fn forget_running(child: &Child) {
     let pid = child.id();
     let mut running = lock_ignoring_poison(&RUNNING_COMMANDS);
     if let Some(index) = running.iter().position(|other| *other == pid) {
@@ -667,7 +632,6 @@ mod tests {
             shell_command(
                 "echo first; printf '10%%\\r50%%\\r100%%\\n'; echo warning >&2; sleep 0.2; printf last",
             ),
-            Isolation::SharedGroup,
             &mut |line| seen.push(line),
         )
         .unwrap();
@@ -694,7 +658,6 @@ mod tests {
         // Act
         let output = run_streaming(
             shell_command("yes stderr | head -c 400000 >&2; yes stdout | head -c 400000"),
-            Isolation::SharedGroup,
             &mut |line| match line.as_str() {
                 "stdout" | "stdou" => stdout += 1,
                 _ => stderr += 1,
@@ -713,14 +676,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn reports_the_exit_status_of_a_failing_command() {
-        let _serial = shared();
+        // Exclusive, because the running list is asserted empty at the end
+        // and another test's command would be on it.
+        let _serial = exclusive();
 
-        let output = run_streaming(
-            shell_command("echo oops >&2; exit 3"),
-            Isolation::OwnGroup,
-            &mut |_| {},
-        )
-        .unwrap();
+        let output = run_streaming(shell_command("echo oops >&2; exit 3"), &mut |_| {}).unwrap();
 
         assert_eq!(output.status.code(), Some(3));
         assert_eq!(exit_label(output.status), "exit 3");
@@ -740,8 +700,8 @@ mod tests {
         let started = Instant::now();
 
         // Act
-        let error = run_streaming(command, Isolation::OwnGroup, &mut |_| {})
-            .expect_err("the command is not allowed to run on");
+        let error =
+            run_streaming(command, &mut |_| {}).expect_err("the command is not allowed to run on");
         ABANDONED.store(false, Ordering::SeqCst);
 
         // Assert
@@ -766,7 +726,7 @@ mod tests {
             for command in [polite, stubborn] {
                 let outcomes = &outcomes;
                 scope.spawn(move || {
-                    let output = run_streaming(command, Isolation::OwnGroup, &mut |_| {});
+                    let output = run_streaming(command, &mut |_| {});
                     lock_ignoring_poison(outcomes)
                         .push(output.map(|output| output.status.success()));
                 });
@@ -794,15 +754,15 @@ mod tests {
     #[test]
     fn keeps_a_group_listed_while_a_background_process_of_the_command_lives() {
         // Arrange: the command itself ends at once and leaves a process behind.
+        // A helper of an earlier test's command may still be winding down in
+        // a group of its own; those are cleared first, so that the one left
+        // behind here is the only one on the list.
         let _serial = exclusive();
+        stop_leftover_commands(Duration::from_secs(2));
 
         // Act
-        let output = run_streaming(
-            shell_command("sleep 30 >/dev/null 2>&1 &"),
-            Isolation::OwnGroup,
-            &mut |_| {},
-        )
-        .unwrap();
+        let output =
+            run_streaming(shell_command("sleep 30 >/dev/null 2>&1 &"), &mut |_| {}).unwrap();
         let running = lock_ignoring_poison(&RUNNING_COMMANDS).clone();
         let leftover = lock_ignoring_poison(&LEFTOVER_GROUPS).clone();
         stop_leftover_commands(Duration::from_secs(2));

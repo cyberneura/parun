@@ -2,7 +2,7 @@
 //! of what its commands wrote, redrawn as the lines arrive.
 
 use crate::{
-    process::{self, Isolation},
+    process,
     runner::{self, Event, Job, JobResult, Outcome},
     terminal::TerminalSession,
     text::{display_width, fit_to_width, plain_text, truncate_to_width},
@@ -358,7 +358,7 @@ pub fn run(jobs: Vec<Job>, concurrency: usize) -> Result<ScreenOutcome> {
     // Bounded like the channel inside `run_jobs`, and for the same reason.
     let (tx, rx) = mpsc::sync_channel(runner::EVENT_QUEUE);
     let worker = thread::spawn(move || {
-        runner::run_jobs(&jobs, concurrency, Isolation::OwnGroup, |event| {
+        runner::run_jobs(&jobs, concurrency, |event| {
             let _ = tx.send(event);
         })
     });

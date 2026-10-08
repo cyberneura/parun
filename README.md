@@ -77,22 +77,23 @@ them are gone.
 
 When standard input or standard output is not a terminal, a pipe or a cron job, or when `--plain`
 is given, the lines of every command are printed as they arrive with the command's name in front,
-and a line names each command's outcome as it ends. The commands then stay in parun's own process
-group, so a Ctrl-C typed at a terminal that parun's output is piped through still reaches them.
+and a line names each command's outcome as it ends. A Ctrl-C typed at a terminal that parun's
+output is piped through, a `kill` of parun's pid, or a reader that closes the pipe, `head` say, all
+stop the commands the same way: they are asked to stop, given three seconds, and then killed.
 
 Standard input is not passed to the commands; they get an empty one.
 
 ## Process handling
 
-Under the screen, anything parun started is stopped when the run ends, including a process a
-command left running in the background: it shares the command's process group, and that group is
-stopped whether the run was aborted or ran to the end. A command that means to leave a process
-behind has to start it in a session of its own, with `setsid` or the like. In the plain output the
-commands share parun's own group, and a process a command leaves behind there is left alone, as any
-other command's would be.
+Every command runs in a process group of its own, and parun keeps hold of that group. Anything
+parun started is stopped when the run ends, including a process a command left running in the
+background: it shares the command's process group, and that group is stopped whether the run was
+aborted or ran to the end. A command that means to leave a process behind has to start it in a
+session of its own, with `setsid` or the like.
 
-If the terminal goes away while the screen is up, or parun is told to terminate, the commands are
-stopped the same way before parun ends.
+If the terminal goes away while the screen is up, or parun is told to terminate with SIGTERM or
+SIGINT, the commands are stopped the same way before parun ends, and parun then dies of the signal
+itself, so a shell script that called it stops on Ctrl-C as it would for any other command.
 
 On Windows there are no process groups to signal; a stop takes the command's process tree down
 with `taskkill` instead, forcibly. Windows is not tested.

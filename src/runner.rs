@@ -1,7 +1,7 @@
 //! Running the commands `concurrency` at a time and reporting what they do
 //! as events on the calling thread.
 
-use crate::process::{self, Isolation, lock_ignoring_poison};
+use crate::process::{self, lock_ignoring_poison};
 use std::{
     path::PathBuf,
     process::ExitStatus,
@@ -81,7 +81,7 @@ pub enum Event {
 }
 
 /// Runs one job to its end, handing each line it writes to `log`.
-pub fn run_job<F>(job: &Job, isolation: Isolation, mut log: F) -> JobResult
+pub fn run_job<F>(job: &Job, mut log: F) -> JobResult
 where
     F: FnMut(String),
 {
@@ -90,7 +90,7 @@ where
     if let Some(directory) = &job.directory {
         command.current_dir(directory);
     }
-    match process::run_streaming(command, isolation, &mut |line| log(line)) {
+    match process::run_streaming(command, &mut |line| log(line)) {
         Ok(output) => JobResult {
             outcome: if output.status.success() {
                 Outcome::Succeeded
@@ -112,12 +112,7 @@ where
 /// thread as the workers report, so a display needs no locking of its own. The
 /// results come back in the order of `jobs`; a run abandoned part way leaves
 /// `None` for the jobs that were never started.
-pub fn run_jobs<F>(
-    jobs: &[Job],
-    concurrency: usize,
-    isolation: Isolation,
-    mut on_event: F,
-) -> Vec<Option<JobResult>>
+pub fn run_jobs<F>(jobs: &[Job], concurrency: usize, mut on_event: F) -> Vec<Option<JobResult>>
 where
     F: FnMut(Event),
 {
@@ -150,7 +145,7 @@ where
                     if event_tx.send(Event::Started { worker, index }).is_err() {
                         return;
                     }
-                    let result = run_job(job, isolation, |line| {
+                    let result = run_job(job, |line| {
                         let _ = event_tx.send(Event::Line {
                             worker,
                             index,
@@ -205,7 +200,7 @@ mod tests {
         let mut events = Vec::new();
 
         // Act
-        let results = run_jobs(&jobs, 2, Isolation::SharedGroup, |event| events.push(event));
+        let results = run_jobs(&jobs, 2, |event| events.push(event));
 
         // Assert: every job finished with its own status and output.
         assert_eq!(results.len(), 3);
@@ -247,7 +242,7 @@ mod tests {
         broken.directory = Some(PathBuf::from("/nonexistent/parun/dir"));
 
         // Act
-        let result = run_job(&broken, Isolation::SharedGroup, |_| {});
+        let result = run_job(&broken, |_| {});
 
         // Assert
         assert!(matches!(result.outcome, Outcome::NotRun(_)));

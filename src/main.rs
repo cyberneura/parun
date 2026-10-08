@@ -8,7 +8,6 @@ mod text;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use process::Isolation;
 use runner::{Event, Job, JobResult, Outcome};
 use std::{
     io::{self, IsTerminal, Read, Write},
@@ -70,7 +69,12 @@ struct Args {
 fn main() {
     let args = Args::parse();
     if let Err(error) = run(args) {
-        eprintln!("parun: {error:#}");
+        terminal::wait_for_signal_exit();
+        // An error on the way out of the screen may leave commands running in
+        // groups of their own; the stop comes before the message, so that a
+        // closed stderr cannot stand between the error and the stop.
+        process::stop_running_commands(Duration::from_secs(2));
+        let _ = writeln!(io::stderr(), "parun: {error:#}");
         std::process::exit(2);
     }
 }
@@ -91,34 +95,31 @@ fn run(args: Args) -> Result<()> {
         print_header(count, concurrency.min(count));
         (outcome.results, outcome.aborted)
     } else {
-        let results =
-            runner::run_jobs(
-                &jobs,
-                concurrency,
-                Isolation::SharedGroup,
-                |event| match event {
-                    Event::Planned { workers } => {
-                        print_header(count, workers);
-                        print_line("");
-                    }
-                    Event::Line { index, line, .. } => {
-                        print_line(&format!("[{}] {line}", jobs[index].name));
-                    }
-                    Event::Finished { index, result, .. } => {
-                        print_line(&format!(
-                            "[{}] \u{2500}\u{2500} {}",
-                            jobs[index].name,
-                            closing(&result)
-                        ));
-                    }
-                    Event::Started { .. } => {}
-                },
-            );
-        // The commands of this path shared this process's group and are out of
-        // reach here, as is anything they left behind.
+        let results = runner::run_jobs(&jobs, concurrency, |event| match event {
+            Event::Planned { workers } => {
+                print_header(count, workers);
+                print_line("");
+            }
+            Event::Line { index, line, .. } => {
+                print_line(&format!("[{}] {line}", jobs[index].name));
+            }
+            Event::Finished { index, result, .. } => {
+                print_line(&format!(
+                    "[{}] \u{2500}\u{2500} {}",
+                    jobs[index].name,
+                    closing(&result)
+                ));
+            }
+            Event::Started { .. } => {}
+        });
+        // The run is over; what is still listed is something a command left
+        // behind, which would otherwise outlive parun.
         process::stop_leftover_commands(Duration::from_secs(3));
         (results, false)
     };
+    // The commands may have ended because a signal is ending parun: the
+    // summary is not wanted then, and the signal is what has to end the process.
+    terminal::wait_for_signal_exit();
 
     print_summary(&jobs, &results);
     if interactive {
@@ -214,8 +215,8 @@ fn read_command_lines(path: &PathBuf) -> Result<Vec<String>> {
 
 /// Writes one line of the plain output. A reader that has gone away, `head`
 /// say, closes the pipe, and going on would only leave the commands running
-/// for nobody; `println!` would panic instead, and the panic would wait for
-/// every worker before it got anywhere.
+/// for nobody, so they are stopped and parun ends; `println!` would panic
+/// instead, and the panic would wait for every worker before it got anywhere.
 fn print_line(line: &str) {
     let mut stdout = io::stdout().lock();
     if writeln!(stdout, "{line}")

@@ -58,17 +58,19 @@ pty 経由で実画面を取れる。Python の `pty.fork()` で起動し、`TIO
 
 ## 設計上の約束
 
-- **端末が Ctrl-C を届けられないコマンドは自分のプロセスグループで走らせる** (`Isolation::OwnGroup`)。
+- **コマンドは常に自分のプロセスグループで走らせ、`RUNNING_COMMANDS` に登録する**。pullkit は plain
+  経路だけ共有グループにして端末の Ctrl-C を直接届けていたが、parun は `kill <pid>`、Docker の PID 1、
+  `parun ... | tee` のようにシグナルが parun の pid にしか来ない場所で使われる。そこで子が残らないよう、
+  plain 経路でもシグナルスレッドが `stop_running_commands` で止める (レビュー指摘で変更)。
   raw mode の画面では Ctrl-C はシグナルにならずキー入力になるので、画面側が
   `interrupt_running_commands` (SIGINT) を送り、2 度目で `terminate_running_commands` (SIGKILL) を
   送る。画面が自分の都合で抜ける時は `stop_running_commands` (SIGINT → 猶予 → SIGKILL)。
-  stdin か stdout が端末でない plain 経路だけが共有グループ (`SharedGroup`) で、パイプ先の端末で
-  打った Ctrl-C がそのまま届く。
 - **端末が消えた時 (SIGHUP) と SIGTERM は自前で受けて `stop_running_commands` してから終わる**
   (`terminal::stop_commands_on_hangup`)。自グループの子には端末の hangup が届かず、デフォルト動作で
   parun だけが先に死ぬと丸ごと残る。stop の後は `exit()` ではなく同じシグナルで自分を殺す
   (`emulate_default_handler`)。bash はスクリプトを止めるかを子が SIGINT で死んだかで判断するので、
-  `exit(130)` に戻すと plain 経路を呼ぶスクリプトが Ctrl-C で止まらなくなる。
+  `exit(130)` に戻すと plain 経路を呼ぶスクリプトが Ctrl-C で止まらなくなる。plain 経路の Ctrl-C は
+  端末から parun だけに届き (子は別グループ)、このスレッドが子へ転送する。
 - **中断 (`stop_running_commands`) と後始末 (`stop_leftover_commands`) は分ける**。前者は
   `ABANDONED` を立てるので、そのプロセスではもう run を始められない。run が終わった後にコマンドが
   残したプロセスを止めるのは後者。
@@ -94,8 +96,8 @@ pty 経由で実画面を取れる。Python の `pty.fork()` で起動し、`TIO
 - **フレームの最終行だけ幅いっぱいまで埋めない**。右下隅に文字を置くとスクロールする端末がある。
 - **コマンドは `sh -c` で起動する**。`make` / `xargs` / `find -exec` と同じ慣習で、`$SHELL` は
   使わない (fish 等で構文が変わる)。stdin は `null`。
-- **plain 経路の `print_line` は書けなくなったら即終了する**。`head` のように読み手が先に閉じた時、
-  `println!` は panic し、その panic は全ワーカーの終了を待ってしまう。
+- **plain 経路の `print_line` は書けなくなったら子を止めて即終了する**。`head` のように読み手が先に
+  閉じた時、`println!` は panic し、その panic は全ワーカーの終了を待ってしまう。
 
 ## リリース
 
