@@ -1,0 +1,35 @@
+[package]
+name = "parun"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+description = "Runs shell commands in parallel, each in its own pane of the terminal"
+license = "MIT"
+repository = "https://github.com/cyberneura/parun"
+readme = "README.md"
+keywords = ["parallel", "runner", "terminal", "concurrently", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+# Development files stay out of the crate: the issue notes, the release
+# machinery and the agent memo mean nothing to someone who installs parun.
+exclude = ["/_issues", "/.github", "/.j-menu.yaml", "/scripts", "/AGENTS.md", "/CLAUDE.md"]
+
+[[bin]]
+name = "parun"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive", "wrap_help"] }
+crossterm = "0.29"
+unicode-segmentation = "1.13"
+unicode-width = "0.2"
+
+[target.'cfg(unix)'.dependencies]
+# Signals the commands' process groups directly, without a `kill` binary.
+libc = "0.2"
+# Catches SIGHUP / SIGTERM / SIGINT so the commands are stopped before parun ends.
+signal-hook = "0.3"
+
+[profile.release]
+strip = true
+lto = "thin"

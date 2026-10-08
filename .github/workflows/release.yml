@@ -1,0 +1,420 @@
+name: Release
+
+# Releases follow the version in Cargo.toml: change it on main and the release
+# happens. Nothing else starts one.
+#
+# What decides whether to release is not the diff -- squash, rebase and a direct
+# push each leave a different one -- but whether that version has been released
+# already. Asking that makes the workflow idempotent: run again over a released
+# version and nothing happens; run again over a failed one and it carries on.
+#
+# Every push to main is looked at, with no path filter. Filtering on Cargo.toml
+# would be cheaper, but it would also mean that a release which failed on the
+# build, the workflow or the code itself could not be retried by pushing the fix
+# -- the fix does not touch Cargo.toml. The check below costs a checkout and one
+# API call, which is less than the recovery it would otherwise cost.
+on:
+  push:
+    branches: [main]
+  # For a version that is right but whose run failed for a reason since fixed and
+  # not yet pushed. The same check applies, so this cannot republish anything.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Serialised so that two pushes in quick succession cannot build the same version
+# twice. `queue: max` holds up to 100 pending rather than the default `single`,
+# which keeps one and cancels the rest; it may not be paired with
+# `cancel-in-progress: true`.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      release: ${{ steps.decide.outputs.release }}
+    steps:
+      # A dispatch names its own ref, and a branch carrying an unreleased version
+      # would otherwise be built and published from wherever it sits. Releases come
+      # from main; a push cannot be anything else, but a dispatch can.
+      - name: Refuse to release from anywhere but main
+        if: github.ref != 'refs/heads/main'
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          echo "::error::releases come from main, and this run is on ${REF}"
+          exit 1
+
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Read version
+        id: version
+        run: |
+          VERSION=$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "parun") | .version')
+          if [ -z "$VERSION" ]; then
+            echo "::error::could not read the version out of Cargo.toml"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether this version still needs releasing
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # This endpoint answers for published releases only -- a draft has no tag
+          # for it to find -- which is the question being asked here. A draft left
+          # by a failed run is dealt with in the release job, which can see it.
+          #
+          # Only 404 counts as "not released". A rate limit or an outage read that
+          # way would build and publish a version that is already out.
+          status=$(gh api "repos/${GH_REPO}/releases/tags/v${VERSION}" \
+            --silent --include 2>/dev/null | head -n 1 | awk '{print $2}' || true)
+          case "$status" in
+            404)
+              echo "release=true" >> "$GITHUB_OUTPUT"
+              echo "Releasing v${VERSION}"
+              ;;
+            200)
+              echo "release=false" >> "$GITHUB_OUTPUT"
+              echo "v${VERSION} is already released; nothing to do."
+              ;;
+            *)
+              echo "::error::could not tell whether v${VERSION} exists (HTTP ${status:-none}). Not guessing."
+              exit 1
+              ;;
+          esac
+
+  # The gate. Called rather than written out here so that a pull request and a
+  # release run the same checks from the same file; being called puts its jobs
+  # in this run, which is what lets `needs` hold the build back.
+  test:
+    needs: plan
+    if: needs.plan.outputs.release == 'true'
+    uses: ./.github/workflows/test.yml
+
+  build:
+    needs: [plan, test]
+    if: needs.plan.outputs.release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Apple Silicon, signed with a Developer ID and notarised: Homebrew
+          # casks put the download in quarantine, and without both the first run
+          # is refused.
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+          # A glibc build, not a portable one.
+          - platform: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 45
+
+    steps:
+      # persist-credentials: false keeps the token out of .git/config. Everything
+      # is pinned to a commit SHA because this job holds the signing certificate:
+      # a moved tag would be enough to take it.
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      # The version comes from rust-toolchain.toml, the same file the tests
+      # read, so that what ships is built with the compiler the checks ran
+      # against. Invoking a rustup proxy is what fetches it.
+      - name: Setup Rust
+        run: cargo --version
+
+      - name: Cache Rust (cargo + target)
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      # A missing secret does not merely skip codesign, it goes unnoticed: an
+      # unsigned archive would ship as though it had been signed.
+      - name: Check macOS signing secrets
+        if: matrix.platform == 'macos-latest'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          missing=()
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
+            APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "${!name}" ]; then
+              missing+=("$name")
+            fi
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Missing repository secrets: ${missing[*]}. Run deploy-github-secret-apple-building.sh to set them."
+            exit 1
+          fi
+          echo "All signing and notarisation secrets are present."
+
+      - name: Import Apple Developer certificate
+        if: matrix.platform == 'macos-latest'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 24)
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          security import "$RUNNER_TEMP/certificate.p12" -k build.keychain \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          # codesign looks identities up in the search list rather than in the
+          # default keychain, so the new keychain has to be added to it.
+          security list-keychains -d user -s build.keychain
+          # find-identity exits 0 even with nothing to show, so the check has to
+          # look at what it printed.
+          security find-identity -v -p codesigning | grep -q "Developer ID Application" || {
+            echo "::error::no 'Developer ID Application' identity in the keychain search list"
+            exit 1
+          }
+          rm "$RUNNER_TEMP/certificate.p12"
+
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --release --locked --target "$TARGET"
+
+      # Notarisation needs the hardened runtime (--options runtime). A bare binary
+      # cannot be stapled -- stapling takes a .app, .dmg or .pkg -- so the ticket
+      # stays with Apple and Gatekeeper fetches it. That covers a download, and
+      # leaves only a first run with no network refused.
+      - name: Sign and notarise
+        if: matrix.platform == 'macos-latest'
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          BIN="target/${TARGET}/release/parun"
+          codesign --force --options runtime --timestamp \
+            --sign "$APPLE_SIGNING_IDENTITY" "$BIN"
+          codesign --verify --strict --verbose=2 "$BIN"
+          # notarytool takes a zip, pkg or dmg, so the binary is wrapped only to be
+          # submitted. What ships is the tar.gz below; the ticket is bound to the
+          # signature, which is the same in either container.
+          ditto -c -k --keepParent "$BIN" "$RUNNER_TEMP/notarize.zip"
+          # The verdict is read rather than left to the exit code: a submission
+          # that comes back Invalid is still a submission that completed.
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" \
+            --wait --timeout 30m --output-format json > "$RUNNER_TEMP/notarize.json"
+          cat "$RUNNER_TEMP/notarize.json"
+          status=$(jq -r .status "$RUNNER_TEMP/notarize.json")
+          if [ "$status" != "Accepted" ]; then
+            id=$(jq -r .id "$RUNNER_TEMP/notarize.json")
+            xcrun notarytool log "$id" --apple-id "$APPLE_ID" \
+              --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" || true
+            echo "::error::notarisation came back $status"
+            exit 1
+          fi
+
+      - name: Package
+        id: package
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          NAME="parun-v${VERSION}-${TARGET}"
+          mkdir -p "dist/$NAME"
+          cp "target/${TARGET}/release/parun" README.md LICENSE "dist/$NAME/"
+          # The archive carries its own directory rather than unpacking into the
+          # current one. The Homebrew cask names that directory in its `binary`
+          # path, since a cask does not descend into it on its own.
+          tar -czf "dist/$NAME.tar.gz" -C dist "$NAME"
+          echo "archive=dist/$NAME.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+
+  # Every target has to be in hand first. The release is assembled as a draft and
+  # published only once its assets are all there: `gh release create` uploads
+  # after creating, so a failure partway would otherwise leave a published release
+  # missing a platform.
+  release:
+    needs: [plan, build]
+    if: needs.plan.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          COMMIT: ${{ github.sha }}
+          EXPECTED_ASSETS: "2"
+        run: |
+          # `--paginate` hands back one array per page, so the pages are flattened
+          # into a single one before anything asks a question of them.
+          set -o pipefail
+          # Drafts left by a run that failed partway are cleared, so that the same
+          # version can be built again instead of being blocked by its own remains.
+          # A published release is never touched: it is the thing this workflow
+          # exists to produce.
+          #
+          # The releases are listed rather than looked up by tag. A draft has no tag
+          # for that endpoint to find, so a lookup would report nothing and the
+          # create below would add a *second* draft under the same name -- from
+          # there, which one gets its assets counted, or published, is a coin toss.
+          releases=$(gh api "repos/${GH_REPO}/releases" --paginate --jq '.[]' | jq -s '.') || {
+            echo "::error::could not list the releases. Not guessing."
+            exit 1
+          }
+          if jq -e --arg tag "v${VERSION}" \
+            'any(.[]; .tag_name == $tag and .draft == false)' <<< "$releases" >/dev/null; then
+            echo "::error::v${VERSION} is published already; refusing to touch it."
+            exit 1
+          fi
+          # Every same-named draft, not just one: an earlier failure may have left
+          # more than one behind.
+          for id in $(jq -r --arg tag "v${VERSION}" \
+            '.[] | select(.tag_name == $tag and .draft) | .id' <<< "$releases"); do
+            # Deleted by id, and without --cleanup-tag: a draft has no tag to clean
+            # up, and asking for one fails the step after the draft is already gone.
+            echo "removing leftover draft $id"
+            gh api -X DELETE "repos/${GH_REPO}/releases/${id}"
+          done
+
+          # The checksums go into the notes so that a cask can be fixed by hand
+          # without fetching the assets again.
+          {
+            echo "## Checksums"
+            echo
+            echo '```'
+            (cd dist && sha256sum *.tar.gz)
+            echo '```'
+          } > "$RUNNER_TEMP/notes.md"
+
+          gh release create "v${VERSION}" \
+            --draft \
+            --target "$COMMIT" \
+            --title "v${VERSION}" \
+            --generate-notes \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            dist/*.tar.gz
+
+          count=$(gh release view "v${VERSION}" --json assets --jq '.assets | length')
+          if [ "$count" -ne "$EXPECTED_ASSETS" ]; then
+            echo "::error::the draft carries $count assets, expected $EXPECTED_ASSETS; leaving it unpublished"
+            exit 1
+          fi
+          gh release edit "v${VERSION}" --draft=false --latest
+
+  # Publishing cannot be undone, so this waits to be switched on with
+  # `gh variable set PUBLISH_CRATES --body true` rather than being on by default.
+  crates:
+    needs: [plan, release]
+    if: needs.plan.outputs.release == 'true' && vars.PUBLISH_CRATES == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        run: cargo --version
+
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "::error::PUBLISH_CRATES is on but CARGO_REGISTRY_TOKEN is not set. Add it with 'gh secret set CARGO_REGISTRY_TOKEN'."
+            exit 1
+          fi
+
+          # What cargo resolves against is the sparse index, not the web API, and
+          # the two do not update together. Only 200 and 404 are answers. Anything
+          # else -- a rate limit, an outage, a broken connection -- is not evidence
+          # of absence, and publishing twice is not possible to undo.
+          indexed() {
+            body=$(mktemp)
+            status=$(curl -s -o "$body" -w '%{http_code}' "https://index.crates.io/pa/ru/parun" || echo 000)
+            answer="unknown:$status"
+            case "$status" in
+              404) answer="no" ;;
+              200)
+                if ! jq -e . < "$body" >/dev/null 2>&1; then
+                  answer="unknown:unparsable"
+                elif jq -e --arg v "$VERSION" 'select(.vers == $v)' < "$body" >/dev/null; then
+                  answer="yes"
+                else
+                  answer="no"
+                fi
+                ;;
+            esac
+            rm -f "$body"
+            echo "$answer"
+          }
+
+          case "$(indexed)" in
+            yes) echo "parun ${VERSION} is already on crates.io"; exit 0 ;;
+            no) ;;
+            *)
+              echo "::error::could not tell whether parun ${VERSION} is published. Not guessing."
+              exit 1
+              ;;
+          esac
+
+          # A failure here is not proof that nothing was published: the registry
+          # can take the crate and the response still be lost. The index is the
+          # only thing that settles it.
+          if ! cargo publish --locked; then
+            for _ in $(seq 12); do
+              sleep 10
+              case "$(indexed)" in
+                yes)
+                  echo "publishing parun ${VERSION} reported a failure, but it is in the index"
+                  exit 0
+                  ;;
+                no) ;;
+                *)
+                  echo "::error::publishing parun ${VERSION} failed and the index cannot be read."
+                  exit 1
+                  ;;
+              esac
+            done
+            echo "::error::publishing parun ${VERSION} failed and it is not in the index"
+            exit 1
+          fi

@@ -1,0 +1,11 @@
+menu:
+  - title: "Run a demo (three commands, panes)"
+    shell: "cargo run -- 'for i in 1 2 3 4 5; do echo build $i; sleep 1; done' 'sleep 2; echo tests passed' 'sleep 1; echo lint failed >&2; exit 1'"
+  - title: "Build release"
+    shell: "cargo build --release"
+  - title: "Check (fmt, clippy, test)"
+    shell: "cargo fmt --all --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked"
+  - title: "Release (minor bump, push to main)"
+    shell: "scripts/release.sh"
+  - title: "Release (patch bump, push to main)"
+    shell: "scripts/release.sh patch"

@@ -1,0 +1,70 @@
+# The gate in front of a release, and the checks a pull request gets.
+#
+# One file serves both because `workflow_call` and `pull_request` can sit on the
+# same workflow. release.yml calls this one with `uses:`, which puts these jobs
+# in *its own run*, so a plain `needs:` is enough to hold the build back until
+# they are green. A separate workflow started by the same push would not do:
+# `needs` cannot reach across runs, and the release would go out beside a red
+# test rather than behind it.
+name: Test
+
+on:
+  workflow_call:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# A pull request keeps one run: a new push replaces the one still going. A call
+# from release.yml is keyed by its run instead, so a release can never queue
+# behind, or cancel, anything, least of all itself.
+concurrency:
+  group: test-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The matrix mirrors the build matrix in release.yml: what is tested is what
+  # is shipped, on the platform it is shipped for.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      # The version and the components come from rust-toolchain.toml, so that
+      # there is one place to change them and CI cannot drift onto a different
+      # compiler than a checkout does. The runners ship rustup, and invoking one
+      # of its proxies is what fetches the pinned toolchain; done in a step of
+      # its own so that a failed download reads as a failed download rather
+      # than as a failed build.
+      - name: Setup Rust
+        run: cargo --version
+
+      - name: Cache Rust (cargo + target)
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      # Formatting does not vary by platform, so one run answers for both legs.
+      - name: Format
+        if: matrix.platform == 'ubuntu-latest'
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      # --locked for the same reason the build job uses it: what is tested has
+      # to be what is built, and a stale Cargo.lock would quietly resolve to
+      # something else.
+      - name: Test
+        run: cargo test --locked

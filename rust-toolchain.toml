@@ -1,0 +1,13 @@
+# The compiler is pinned rather than tracking stable, because the checks in
+# test.yml gate the release: a new stable bringing a new clippy lint would
+# otherwise turn a release red without anything in the tree having changed.
+# Moving to a newer compiler is a commit, made when there is time to fix what it
+# finds, rather than something that happens on its own the day Rust ships.
+#
+# rustup reads this file, so a rustup-managed cargo uses the version named here
+# on its own. A cargo installed some other way (Homebrew's `rust` formula, say)
+# ignores it and compiles with whatever it is, which is how a lint can pass
+# locally and fail in CI.
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]
