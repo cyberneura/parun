@@ -558,29 +558,39 @@ pub fn exit_label(status: ExitStatus) -> String {
     )
 }
 
+/// `ABANDONED` and `RUNNING_COMMANDS` are shared by the whole process, and
+/// every command any test runs reads the one and joins the other. A test that
+/// sets the flag, stops the running commands, or asserts what the lists hold
+/// takes this exclusively; a test that merely runs commands takes it shared,
+/// so those still run together. Every test in the crate that starts a command
+/// has to take one of the two, or an exclusive test elsewhere kills its
+/// commands from under it.
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod test_serial {
+    use super::ABANDONED;
+    use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard, atomic::Ordering};
 
-    /// `ABANDONED` and `RUNNING_COMMANDS` are shared by the whole process, and
-    /// every command reads the one and joins the other. A test that sets the
-    /// flag or stops the running commands takes this exclusively; a test that
-    /// merely runs commands takes it shared, so those still run together.
-    static ABANDON_FLAG: std::sync::RwLock<()> = std::sync::RwLock::new(());
+    static ABANDON_FLAG: RwLock<()> = RwLock::new(());
 
-    fn shared() -> std::sync::RwLockReadGuard<'static, ()> {
+    pub(crate) fn shared() -> RwLockReadGuard<'static, ()> {
         ABANDON_FLAG
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn exclusive() -> std::sync::RwLockWriteGuard<'static, ()> {
+    pub(crate) fn exclusive() -> RwLockWriteGuard<'static, ()> {
         let guard = ABANDON_FLAG
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         ABANDONED.store(false, Ordering::SeqCst);
         guard
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_serial::{exclusive, shared};
+    use super::*;
 
     #[test]
     fn splits_a_line_that_never_ends_instead_of_holding_it_whole() {

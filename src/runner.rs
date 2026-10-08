@@ -192,6 +192,7 @@ mod tests {
     #[test]
     fn runs_the_jobs_in_slots_and_reports_each_in_order() {
         // Arrange: three jobs on two workers, so one slot takes two jobs.
+        let _serial = process::test_serial::shared();
         let jobs = vec![
             job("a", "sleep 0.3; echo a-done"),
             job("b", "echo b-done; exit 2"),
@@ -238,6 +239,7 @@ mod tests {
     #[test]
     fn a_command_that_cannot_start_is_reported_rather_than_fatal() {
         // Arrange: a working directory that does not exist.
+        let _serial = process::test_serial::shared();
         let mut broken = job("x", "echo never");
         broken.directory = Some(PathBuf::from("/nonexistent/parun/dir"));
 
