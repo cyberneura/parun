@@ -41,6 +41,9 @@ parun [OPTIONS] [COMMAND]...
   -n, --names <NAME>     Names for the commands, in order, comma separated
   -j, --jobs <N>         How many commands run at a time [default: all of them]
   -C, --directory <DIR>  Run the commands in this directory instead of the current one
+      --close-after <SECONDS>
+                         Close the pane of a command that succeeded this many seconds after it
+                         ends, per command, comma separated like --names
       --plain            Print one merged log, as when the output is piped, even on a terminal
 ```
 
@@ -70,8 +73,26 @@ to one merged log with the command's name in front of each line. A pane whose co
 names its outcome in the title, green for success and red for failure, and the rule that closes the
 command's part of the pane carries the exit status and the time it took.
 
+A command that is done in a moment, run beside one that keeps going, would hold on to its pane
+for the rest of the run. `--close-after` closes the pane of a command that succeeded that many
+seconds after it ended, and the panes still open share out its rows:
+
+```shell
+parun --close-after ',3' 'npm run dev' 'open http://localhost:5173/'
+```
+
+The values go to the commands in order, comma separated like `--names`; an empty one keeps that
+command's pane, a single value applies to every command, and `0` closes the pane as soon as the
+command ends. Fractions of a second are accepted. While a pane waits to close, its title counts
+down the seconds. A command that failed keeps its pane whatever the value, so its output can be
+read, and a worker that takes another command brings its pane back. The option only concerns the
+panes: the merged log, whether piped, asked for with `--plain`, or shown because the terminal is
+too small for panes, is not affected by it.
+
 Ctrl-C asks the running commands to stop, so they can clean up; a second Ctrl-C kills them. Once
-every command is done, a key press leaves the screen, and the summary is printed to the terminal,
+every command is done, a key press leaves the screen, or, when `--close-after` has closed every
+pane, the screen leaves by itself; either way the summary, which lists every command, closed or
+not, is printed to the terminal,
 followed by the last lines of output of each command that failed, since the panes that showed
 them are gone.
 
