@@ -65,10 +65,22 @@ struct Pane {
     job: Option<usize>,
     state: PaneState,
     lines: VecDeque<String>,
+    /// When the pane goes away, for a job that succeeded and was given a
+    /// `--close-after`.
+    close_at: Option<Instant>,
+    /// Gone from the screen, leaving its rows to the others. The worker taking
+    /// another job brings it back.
+    closed: bool,
 }
 
 pub struct Screen {
     names: Vec<String>,
+    /// How long each job's pane stays once the job has succeeded, by job
+    /// index; `None`, or no entry, keeps it.
+    close_after: Vec<Option<Duration>>,
+    /// The time the screen goes by, moved on by `advance`. Kept here rather
+    /// than read from the system so that a frame depends on nothing else.
+    now: Instant,
     panes: Vec<Pane>,
     merged: VecDeque<String>,
     finished: Vec<JobResult>,
@@ -87,12 +99,42 @@ impl Screen {
     pub fn new(names: Vec<String>) -> Self {
         Self {
             names,
+            close_after: Vec::new(),
+            now: Instant::now(),
             panes: Vec::new(),
             merged: VecDeque::new(),
             finished: Vec::new(),
             abort: Abort::None,
             all_done: false,
         }
+    }
+
+    /// Sets how long each job's pane stays once the job has succeeded.
+    pub fn with_close_after(mut self, close_after: Vec<Option<Duration>>) -> Self {
+        self.close_after = close_after;
+        self
+    }
+
+    /// Moves the screen's clock on to `now` and closes the panes that are due.
+    /// Answers whether the frame changed: a pane closed, or a countdown in a
+    /// title went down by a second.
+    pub fn advance(&mut self, now: Instant) -> bool {
+        let before = self.now;
+        self.now = now;
+        let mut changed = false;
+        for pane in &mut self.panes {
+            let Some(close_at) = pane.close_at else {
+                continue;
+            };
+            if now >= close_at {
+                pane.close_at = None;
+                pane.closed = true;
+                changed = true;
+            } else if seconds_left(close_at, before) != seconds_left(close_at, now) {
+                changed = true;
+            }
+        }
+        changed
     }
 
     fn name(&self, index: usize) -> &str {
@@ -107,6 +149,8 @@ impl Screen {
                         job: None,
                         state: PaneState::Waiting,
                         lines: VecDeque::new(),
+                        close_at: None,
+                        closed: false,
                     })
                     .collect();
             }
@@ -123,6 +167,8 @@ impl Screen {
                 }
                 pane.job = Some(index);
                 pane.state = PaneState::Running;
+                pane.close_at = None;
+                pane.closed = false;
             }
             Event::Line {
                 worker,
@@ -145,6 +191,14 @@ impl Screen {
                 let closing = closing_line(&result);
                 let merged = format!("[{}] {closing}", self.name(index));
                 push_line(&mut self.merged, MERGED_HISTORY, merged);
+                // Only a success goes away: a failure stays for its output.
+                let close_after = self
+                    .close_after
+                    .get(index)
+                    .copied()
+                    .flatten()
+                    .filter(|_| result.succeeded());
+                let now = self.now;
                 if let Some(pane) = self.panes.get_mut(worker) {
                     pane.state = if result.succeeded() {
                         PaneState::Succeeded
@@ -152,6 +206,13 @@ impl Screen {
                         PaneState::Failed
                     };
                     push_line(&mut pane.lines, PANE_HISTORY, closing);
+                    match close_after {
+                        Some(delay) if delay.is_zero() => pane.closed = true,
+                        // A delay too long for the clock to reach is as good as
+                        // never, and `now + delay` would panic.
+                        Some(delay) => pane.close_at = now.checked_add(delay),
+                        None => {}
+                    }
                 }
                 self.finished.push(result);
             }
@@ -167,10 +228,13 @@ impl Screen {
         let Some(body_rows) = height.checked_sub(1) else {
             return rows;
         };
-        let pane_rows = body_rows.checked_div(self.panes.len()).unwrap_or(0);
-        let log_rows = pane_rows.saturating_sub(1);
-        if log_rows >= MIN_LOG_ROWS {
-            for pane in &self.panes {
+        if self.shows_panes(height) {
+            // The panes still open share the rows; a closed one leaves its
+            // rows to them.
+            let open: Vec<&Pane> = self.panes.iter().filter(|pane| !pane.closed).collect();
+            let pane_rows = body_rows.checked_div(open.len()).unwrap_or(0);
+            let log_rows = pane_rows.saturating_sub(1);
+            for pane in open {
                 rows.push(title_row(&self.pane_title(pane), width, pane_color(pane)));
                 rows.extend(tail_rows(&pane.lines, log_rows, width));
             }
@@ -199,6 +263,25 @@ impl Screen {
         rows
     }
 
+    /// Whether a screen `height` rows tall shows the panes, rather than the
+    /// merged log. Decided by every pane, closed or not: closing is for the
+    /// panes, and the merged log, where nothing closes, stays as it is.
+    fn shows_panes(&self, height: usize) -> bool {
+        let body_rows = height.saturating_sub(1);
+        let pane_rows = body_rows.checked_div(self.panes.len()).unwrap_or(0);
+        pane_rows.saturating_sub(1) >= MIN_LOG_ROWS
+    }
+
+    /// Whether the screen can leave without a key press: every job has
+    /// reported and every pane has closed, so there is nothing left to read.
+    /// The merged log waits for a key as ever.
+    pub fn is_finished_without_panes(&self, height: usize) -> bool {
+        self.all_done
+            && !self.panes.is_empty()
+            && self.panes.iter().all(|pane| pane.closed)
+            && self.shows_panes(height)
+    }
+
     fn pane_title(&self, pane: &Pane) -> String {
         let Some(index) = pane.job else {
             return "waiting".to_owned();
@@ -206,7 +289,13 @@ impl Screen {
         let name = self.name(index);
         match pane.state {
             PaneState::Waiting | PaneState::Running => name.to_owned(),
-            PaneState::Succeeded => format!("{name}  done"),
+            PaneState::Succeeded => match pane.close_at {
+                Some(close_at) => format!(
+                    "{name}  done  closes in {}s",
+                    seconds_left(close_at, self.now)
+                ),
+                None => format!("{name}  done"),
+            },
             PaneState::Failed => format!("{name}  FAILED"),
         }
     }
@@ -241,6 +330,15 @@ impl Screen {
             }
         }
     }
+}
+
+/// Whole seconds from `now` to `close_at`, rounded up, so that a countdown
+/// shows `1s` until the moment the pane goes.
+fn seconds_left(close_at: Instant, now: Instant) -> u128 {
+    close_at
+        .saturating_duration_since(now)
+        .as_millis()
+        .div_ceil(1000)
 }
 
 fn pane_color(pane: &Pane) -> Color {
@@ -352,9 +450,14 @@ pub struct ScreenOutcome {
 /// screen has to pass it on itself. Should the screen itself fail, because the
 /// terminal went away, the commands are stopped before the error is returned;
 /// nothing else would be left to stop them.
-pub fn run(jobs: Vec<Job>, concurrency: usize) -> Result<ScreenOutcome> {
+pub fn run(
+    jobs: Vec<Job>,
+    concurrency: usize,
+    close_after: Vec<Option<Duration>>,
+) -> Result<ScreenOutcome> {
     let mut terminal = TerminalSession::enter()?;
-    let mut screen = Screen::new(jobs.iter().map(|job| job.name.clone()).collect());
+    let mut screen = Screen::new(jobs.iter().map(|job| job.name.clone()).collect())
+        .with_close_after(close_after);
     // Bounded like the channel inside `run_jobs`, and for the same reason.
     let (tx, rx) = mpsc::sync_channel(runner::EVENT_QUEUE);
     let worker = thread::spawn(move || {
@@ -384,7 +487,10 @@ pub fn run(jobs: Vec<Job>, concurrency: usize) -> Result<ScreenOutcome> {
 }
 
 /// Draws the screen and answers the keyboard until every worker has reported
-/// and a key has been pressed.
+/// and a key has been pressed, or until every pane has closed. The keyboard is
+/// polled with a timeout of one frame, so the loop comes round at least that
+/// often even with nothing happening: that is what moves the close countdowns
+/// on and closes the panes that are due.
 fn watch(
     terminal: &mut TerminalSession,
     screen: &mut Screen,
@@ -393,6 +499,9 @@ fn watch(
     let mut dirty = true;
     let mut last_frame = Instant::now() - FRAME_INTERVAL;
     loop {
+        if screen.advance(Instant::now()) {
+            dirty = true;
+        }
         for _ in 0..EVENTS_PER_FRAME {
             match rx.try_recv() {
                 Ok(event) => {
@@ -419,6 +528,12 @@ fn watch(
             )?;
             dirty = false;
             last_frame = Instant::now();
+        }
+        if screen.all_done {
+            let (_, height) = terminal::size()?;
+            if screen.is_finished_without_panes(usize::from(height)) {
+                return Ok(());
+            }
         }
         if !event::poll(FRAME_INTERVAL)? {
             continue;
@@ -735,6 +850,226 @@ mod tests {
         );
         assert_eq!(rows[4].color, Some(Color::DarkGrey));
         assert!(rows[5].text.starts_with("second output"));
+    }
+
+    /// Two jobs on two workers, both started, with the given `--close-after`.
+    fn two_running(close_after: Vec<Option<Duration>>) -> Screen {
+        let mut screen = planned(2, &["server", "open"]).with_close_after(close_after);
+        for index in 0..2 {
+            screen.apply(Event::Started {
+                worker: index,
+                index,
+            });
+        }
+        screen
+    }
+
+    fn finish(screen: &mut Screen, index: usize, result: JobResult) {
+        screen.apply(Event::Finished {
+            worker: index,
+            index,
+            result,
+        });
+    }
+
+    #[test]
+    fn closes_the_pane_of_a_job_that_succeeded_once_its_time_is_up() {
+        // Arrange
+        let mut screen = two_running(vec![None, Some(Duration::from_secs(3))]);
+        let start = screen.now;
+        finish(&mut screen, 1, succeeded());
+
+        // Act: the countdown in the title, and the frame after the time is up.
+        let counting = screen.frame(60, 21);
+        let ticked = screen.advance(start + Duration::from_millis(1500));
+        let still_counting = screen.frame(60, 21);
+        let closed = screen.advance(start + Duration::from_secs(3));
+        let rows = screen.frame(60, 21);
+
+        // Assert: two panes of ten rows while it counts down, then the one
+        // left open has all twenty.
+        assert!(
+            counting[10].text.contains(" open  done  closes in 3s "),
+            "{}",
+            counting[10].text
+        );
+        assert!(ticked);
+        assert!(
+            still_counting[10]
+                .text
+                .contains(" open  done  closes in 2s "),
+            "{}",
+            still_counting[10].text
+        );
+        assert!(closed);
+        let texts = texts(&rows);
+        assert!(texts[0].contains(" server "), "{}", texts[0]);
+        assert!(texts[1..20].iter().all(|text| !text.contains(" open ")));
+        assert!(!screen.is_finished_without_panes(21));
+    }
+
+    #[test]
+    fn redraws_only_when_the_countdown_shows_another_second() {
+        // Arrange
+        let mut screen = two_running(vec![None, Some(Duration::from_secs(3))]);
+        let start = screen.now;
+        finish(&mut screen, 1, succeeded());
+
+        // Act / Assert: 3s left shows as 3s until the first second is gone.
+        assert!(!screen.advance(start + Duration::from_millis(500)));
+        assert!(!screen.advance(start + Duration::from_millis(999)));
+        assert!(screen.advance(start + Duration::from_millis(1001)));
+    }
+
+    #[test]
+    fn zero_closes_the_pane_as_the_job_ends() {
+        // Arrange
+        let mut screen = two_running(vec![Some(Duration::ZERO); 2]);
+
+        // Act
+        finish(&mut screen, 1, succeeded());
+        let rows = screen.frame(60, 21);
+
+        // Assert
+        let texts = texts(&rows);
+        assert!(texts[0].contains(" server "), "{}", texts[0]);
+        assert!(texts[1..20].iter().all(|text| !text.contains(" open ")));
+    }
+
+    #[test]
+    fn a_delay_past_the_clock_keeps_the_pane_instead_of_panicking() {
+        // Arrange
+        let mut screen = two_running(vec![None, Some(Duration::MAX)]);
+
+        // Act
+        finish(&mut screen, 1, succeeded());
+        let rows = screen.frame(60, 21);
+
+        // Assert
+        assert!(rows[10].text.contains(" open  done "), "{}", rows[10].text);
+        assert!(!rows[10].text.contains("closes"), "{}", rows[10].text);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keeps_the_pane_of_a_job_that_failed() {
+        // Arrange
+        let mut screen = two_running(vec![Some(Duration::ZERO); 2]);
+        let start = screen.now;
+
+        // Act
+        finish(&mut screen, 1, failed(1));
+        screen.advance(start + Duration::from_secs(60));
+        let rows = screen.frame(60, 21);
+
+        // Assert
+        assert!(
+            rows[10].text.contains(" open  FAILED "),
+            "{}",
+            rows[10].text
+        );
+        assert!(!rows[10].text.contains("closes"), "{}", rows[10].text);
+    }
+
+    #[test]
+    fn an_empty_value_keeps_the_pane() {
+        // Arrange: `--close-after ',0'`, so only the second job closes.
+        let mut screen = two_running(vec![None, Some(Duration::ZERO)]);
+        let start = screen.now;
+
+        // Act
+        finish(&mut screen, 0, succeeded());
+        finish(&mut screen, 1, succeeded());
+        screen.advance(start + Duration::from_secs(60));
+        let rows = screen.frame(60, 21);
+
+        // Assert
+        assert!(rows[0].text.contains(" server  done "), "{}", rows[0].text);
+        assert!(!rows[0].text.contains("closes"), "{}", rows[0].text);
+        assert!(
+            texts(&rows)[1..20]
+                .iter()
+                .all(|text| !text.contains(" open "))
+        );
+    }
+
+    #[test]
+    fn leaves_without_a_key_once_every_pane_has_closed() {
+        // Arrange
+        let mut screen = two_running(vec![Some(Duration::from_secs(1)); 2]);
+        let start = screen.now;
+        finish(&mut screen, 0, succeeded());
+        finish(&mut screen, 1, succeeded());
+        screen.all_done = true;
+
+        // Act
+        let while_counting = screen.is_finished_without_panes(21);
+        screen.advance(start + Duration::from_secs(1));
+        let closed = screen.is_finished_without_panes(21);
+        let rows = screen.frame(60, 21);
+
+        // Assert: nothing is left to draw but the footer.
+        assert!(!while_counting);
+        assert!(closed);
+        assert!(rows[..20].iter().all(|row| row.text.trim().is_empty()));
+    }
+
+    #[test]
+    fn a_closed_pane_comes_back_when_its_worker_takes_another_job() {
+        // Arrange: one worker, two jobs, the first closing at once.
+        let mut screen =
+            planned(1, &["first", "second"]).with_close_after(vec![Some(Duration::ZERO); 2]);
+        screen.apply(Event::Started {
+            worker: 0,
+            index: 0,
+        });
+        finish(&mut screen, 0, succeeded());
+        let closed = screen.frame(60, 9);
+
+        // Act
+        screen.apply(Event::Started {
+            worker: 0,
+            index: 1,
+        });
+        let rows = screen.frame(60, 9);
+
+        // Assert
+        assert!(closed[0].text.trim().is_empty(), "{}", closed[0].text);
+        assert!(rows[0].text.contains(" second "), "{}", rows[0].text);
+    }
+
+    #[test]
+    fn the_merged_log_ignores_closing_and_waits_for_a_key() {
+        // Arrange: ten workers on 24 rows give the merged log.
+        let names: Vec<String> = (0..10).map(|i| format!("job-{i}")).collect();
+        let mut screen = Screen::new(names).with_close_after(vec![Some(Duration::ZERO); 10]);
+        screen.apply(Event::Planned { workers: 10 });
+        for index in 0..10 {
+            screen.apply(Event::Started {
+                worker: index,
+                index,
+            });
+            finish(&mut screen, index, succeeded());
+        }
+        screen.all_done = true;
+
+        // Act
+        let rows = screen.frame(80, 24);
+
+        // Assert: the log is still there, and the screen waits as ever; on a
+        // tall enough terminal the closed panes would have let it go.
+        assert!(
+            rows[0].text.contains("too small for panes"),
+            "{}",
+            rows[0].text
+        );
+        assert!(
+            rows[1].text.starts_with("[job-0] ── ok"),
+            "{}",
+            rows[1].text
+        );
+        assert!(!screen.is_finished_without_panes(24));
+        assert!(screen.is_finished_without_panes(41));
     }
 
     #[test]

@@ -36,6 +36,7 @@ const FAILURE_TAIL_LINES: usize = 20;
                   parun 'cargo build' 'npm test' 'ruff check .'\n  \
                   parun -n build,test 'cargo build' 'npm test'\n  \
                   parun -j 2 -f commands.txt\n  \
+                  parun --close-after ',3' 'npm run dev' 'open http://localhost:5173/'\n  \
                   printf 'make -C a\\nmake -C b\\n' | parun"
 )]
 struct Args {
@@ -61,9 +62,40 @@ struct Args {
     #[arg(short = 'C', long, value_name = "DIR")]
     directory: Option<PathBuf>,
 
+    /// Close the pane of a command that succeeded this many seconds after it
+    /// ends, so the other panes get its rows. Per command, in order, comma
+    /// separated like --names; a single value applies to every command, an
+    /// empty one keeps that command's pane, and 0 closes it at once. A failed
+    /// command's pane stays. Has no effect without panes
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        value_delimiter = ',',
+        value_parser = parse_close_after
+    )]
+    close_after: Vec<CloseAfter>,
+
     /// Print one merged log, as when the output is piped, even on a terminal
     #[arg(long)]
     plain: bool,
+}
+
+/// One element of `--close-after`: how long a succeeded command's pane stays,
+/// or `None` for an empty element, which keeps it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CloseAfter(Option<Duration>);
+
+fn parse_close_after(value: &str) -> Result<CloseAfter, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(CloseAfter(None));
+    }
+    let seconds: f64 = value
+        .parse()
+        .map_err(|_| format!("`{value}` is not a number of seconds"))?;
+    Duration::try_from_secs_f64(seconds)
+        .map(|delay| CloseAfter(Some(delay)))
+        .map_err(|_| format!("`{value}` is not a number of seconds from 0 up"))
 }
 
 fn main() {
@@ -89,9 +121,10 @@ fn run(args: Args) -> Result<()> {
     terminal::stop_commands_on_hangup()?;
 
     let count = jobs.len();
+    let close_after = close_after_per_command(&args.close_after, count)?;
     let interactive = !args.plain && io::stdin().is_terminal() && io::stdout().is_terminal();
     let (results, aborted) = if interactive {
-        let outcome = screen::run(jobs.clone(), concurrency)?;
+        let outcome = screen::run(jobs.clone(), concurrency, close_after)?;
         print_header(count, concurrency.min(count));
         (outcome.results, outcome.aborted)
     } else {
@@ -191,6 +224,25 @@ fn collect_jobs(args: &Args) -> Result<Vec<Job>> {
             }
         })
         .collect())
+}
+
+/// The `--close-after` delay of each of `count` commands. A single value
+/// stands for every command; otherwise the values go to the commands in order,
+/// like the names, and a command past the last value keeps its pane.
+fn close_after_per_command(values: &[CloseAfter], count: usize) -> Result<Vec<Option<Duration>>> {
+    if let [CloseAfter(delay)] = values {
+        return Ok(vec![*delay; count]);
+    }
+    if values.len() > count {
+        bail!(
+            "{} --close-after values were given for {} commands",
+            values.len(),
+            count
+        );
+    }
+    let mut delays: Vec<Option<Duration>> = values.iter().map(|value| value.0).collect();
+    delays.resize(count, None);
+    Ok(delays)
 }
 
 /// One command per line. Blank lines and comments are skipped, so a file can
@@ -310,6 +362,86 @@ fn print_failure_tails(jobs: &[Job], results: &[Option<JobResult>]) {
         ));
         for line in &lines[skip..] {
             print_line(line);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn close_after(arguments: &[&str]) -> Result<Vec<Option<Duration>>> {
+        let args = Args::try_parse_from(arguments)?;
+        let count = args.commands.len();
+        close_after_per_command(&args.close_after, count)
+    }
+
+    const fn seconds(seconds: u64) -> Option<Duration> {
+        Some(Duration::from_secs(seconds))
+    }
+
+    #[test]
+    fn close_after_goes_to_the_commands_in_order() {
+        // Act
+        let delays = close_after(&["parun", "--close-after", ",,3", "a", "b", "c"]).unwrap();
+
+        // Assert: the empty elements keep their panes.
+        assert_eq!(delays, vec![None, None, seconds(3)]);
+    }
+
+    #[test]
+    fn a_single_close_after_applies_to_every_command() {
+        // Act
+        let delays = close_after(&["parun", "--close-after", "5", "a", "b", "c"]).unwrap();
+
+        // Assert
+        assert_eq!(delays, vec![seconds(5); 3]);
+    }
+
+    #[test]
+    fn close_after_takes_zero_and_fractions_and_leaves_the_rest_open() {
+        // Act
+        let delays = close_after(&["parun", "--close-after", "0,1.5", "a", "b", "c"]).unwrap();
+
+        // Assert
+        assert_eq!(
+            delays,
+            vec![
+                Some(Duration::ZERO),
+                Some(Duration::from_millis(1500)),
+                None
+            ]
+        );
+    }
+
+    #[test]
+    fn no_close_after_keeps_every_pane() {
+        assert_eq!(close_after(&["parun", "a", "b"]).unwrap(), vec![None, None]);
+    }
+
+    #[test]
+    fn more_close_after_values_than_commands_is_an_error() {
+        // Act
+        let error = close_after(&["parun", "--close-after", "1,2,3", "a", "b"]).unwrap_err();
+
+        // Assert
+        assert_eq!(
+            error.to_string(),
+            "3 --close-after values were given for 2 commands"
+        );
+    }
+
+    #[test]
+    fn close_after_must_be_a_number_of_seconds() {
+        for value in ["soon", "-1", "nan", "1s"] {
+            let argument = format!("--close-after={value}");
+            let parsed = Args::try_parse_from(["parun", argument.as_str(), "a"]);
+            let error = parsed.unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{value}"
+            );
         }
     }
 }
