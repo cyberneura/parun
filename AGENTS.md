@@ -52,7 +52,7 @@ stdout をパイプにつなげば plain 経路になる (`./target/debug/parun 
 ### ペイン画面
 
 pty 経由で実画面を取れる。Python の `pty.fork()` で起動し、`TIOCSWINSZ` でサイズを与え、
-出力からエスケープシーケンスを落として行を読む。「press any key」が出たらキーを送る。Ctrl-C は
+出力からエスケープシーケンスを落として行を読む。「Enter quit」が出たら Enter を送る (ナビゲーションのキーでは抜けない)。Ctrl-C は
 `\x03` を書けば raw mode のキー入力として届く。中断の検証では、終了後に `pgrep -fl "^sleep 30"`
 で子が残っていないことまで見る。
 
@@ -94,6 +94,21 @@ pty 経由で実画面を取れる。Python の `pty.fork()` で起動し、`TIO
   `pad_to_width` を使い、`chars().count()` や `{:<20}` で幅を扱わない。切り詰めは書記素クラスタ境界で
   行い、絵文字を途中で割らない。
 - **フレームの最終行だけ幅いっぱいまで埋めない**。右下隅に文字を置くとスクロールする端末がある。
+- **ペインのスクロールバック (CYBERNEURA-DEV-1109)**: 各ペインと merged log は `Log` (有界の
+  `VecDeque` + `top: Option<usize>`) で、`top` が `None` なら末尾を追う。スクロール位置は
+  「末尾からの距離」ではなく**先頭からの行番号**で持つ — 距離で持つと、読んでいる最中に新しい行が
+  来るたびに表示が流れる。履歴が溢れて `pop_front` した時は `top` を 1 減らして同じ行を見せ続ける。
+  末尾まで戻ったら `None` に戻し、また追従する (`Log::scroll`)。キーが効くペインは `Screen::active`
+  (worker 番号) で、閉じたペインが active なら開いている最初のペインに委ねる (`active_among`)。
+  番号 `[n]` と `>` の印は開いているペインが 2 つ以上の時だけ出す。
+  履歴は行数 (`PANE_HISTORY` 2,000 / `MERGED_HISTORY` 5,000) に加えて**バイト数でも抑える**
+  (`PANE_BYTES` 4 MiB / `MERGED_BYTES` 8 MiB。Codex の指摘)。1 行は `MAX_LINE_BYTES` = 64 KiB まで
+  あり得るので、行数だけだと 1 ペインで 125 MiB 持てる。超えたら古い行から落とし、`top` も追従させる。
+  **マウスホイールのために画面中は `EnableMouseCapture` を入れている** (`TerminalSession`)。
+  これを入れると端末のドラッグ選択は Shift 併用になる (README に明記)。SIGHUP / SIGTERM の経路
+  (`stop_commands_on_hangup`) でも `DisableMouseCapture` を出してから抜ける。
+  全コマンド終了後は、ナビゲーションのキー (`navigation_for` が `Some` を返すもの) は画面を抜けず、
+  それ以外のキーで抜ける。「press any key」ではなく「Enter quit」と出しているのはそのため。
 - **コマンドは `sh -c` で起動する**。`make` / `xargs` / `find -exec` と同じ慣習で、`$SHELL` は
   使わない (fish 等で構文が変わる)。stdin は `null`。
 - **plain 経路の `print_line` は書けなくなったら子を止めて即終了する**。`head` のように読み手が先に

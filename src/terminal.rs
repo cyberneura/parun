@@ -5,6 +5,7 @@ use crate::process;
 use anyhow::{Result, bail};
 use crossterm::{
     cursor::{Hide, Show},
+    event::{DisableMouseCapture, EnableMouseCapture},
     execute,
     style::ResetColor,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
@@ -47,7 +48,8 @@ pub fn wait_for_signal_exit() {
     }
 }
 
-/// Raw mode on the alternate screen, from `enter` until the drop.
+/// Raw mode on the alternate screen, with the mouse reported so that the wheel
+/// can scroll a pane, from `enter` until the drop.
 pub struct TerminalSession {
     pub stdout: io::Stdout,
 }
@@ -60,7 +62,7 @@ impl TerminalSession {
         }
         terminal::enable_raw_mode()?;
         let mut stdout = io::stdout();
-        if let Err(error) = execute!(stdout, EnterAlternateScreen, Hide) {
+        if let Err(error) = execute!(stdout, EnterAlternateScreen, Hide, EnableMouseCapture) {
             let _ = terminal::disable_raw_mode();
             return Err(error.into());
         }
@@ -71,7 +73,13 @@ impl TerminalSession {
 impl Drop for TerminalSession {
     fn drop(&mut self) {
         let _ = terminal::disable_raw_mode();
-        let _ = execute!(self.stdout, Show, LeaveAlternateScreen, ResetColor);
+        let _ = execute!(
+            self.stdout,
+            DisableMouseCapture,
+            Show,
+            LeaveAlternateScreen,
+            ResetColor
+        );
     }
 }
 
@@ -110,7 +118,13 @@ pub fn stop_commands_on_hangup() -> Result<()> {
         // look at the terminal and the death of the process.
         let _gate = terminal_gate();
         if terminal::is_raw_mode_enabled().unwrap_or(false) {
-            let _ = execute!(io::stdout(), Show, LeaveAlternateScreen, ResetColor);
+            let _ = execute!(
+                io::stdout(),
+                DisableMouseCapture,
+                Show,
+                LeaveAlternateScreen,
+                ResetColor
+            );
             let _ = terminal::disable_raw_mode();
         }
         // The call does not return: it raises the signal with its default
