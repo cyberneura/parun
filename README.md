@@ -89,10 +89,21 @@ read, and a worker that takes another command brings its pane back. The option o
 panes: the merged log, whether piped, asked for with `--plain`, or shown because the terminal is
 too small for panes, is not affected by it.
 
+A pane shows the tail of its output, but keeps the last 2,000 lines, and the merged log the last
+5,000, and either can be scrolled back through, while the commands run or after they are done.
+Up and Down, `k` and `j`, or Ctrl-P and Ctrl-N move a line; PageUp and PageDown, or Ctrl-U and
+Ctrl-D, a page; Home and `g` go to the oldest line kept, and End and `G` back to the tail, which
+the pane follows again from then on. While a pane is scrolled back, its title says how many lines
+lie below the view, and new output does not move what is being read. The keys go to the pane whose
+title carries a `>`: `1` to `9` pick a pane by the number in its title, and Tab and Shift-Tab move
+to the next and the previous one. The mouse wheel scrolls the pane under the pointer, and makes it
+the one the keys go to; since the terminal reports the mouse to parun while the screen is up,
+selecting text with the mouse takes the terminal's usual override, Shift in most of them.
+
 Ctrl-C asks the running commands to stop, so they can clean up; a second Ctrl-C kills them. Once
-every command is done, a key press leaves the screen, or, when `--close-after` has closed every
-pane, the screen leaves by itself; either way the summary, which lists every command, closed or
-not, is printed to the terminal,
+every command is done, any key other than the scrolling keys above, Enter say, leaves the screen,
+or, when `--close-after` has closed every pane, the screen leaves by itself; either way the summary,
+which lists every command, closed or not, is printed to the terminal,
 followed by the last lines of output of each command that failed, since the panes that showed
 them are gone.
 
