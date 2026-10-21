@@ -28,11 +28,15 @@ use std::{
 
 /// Lines kept per pane. A pane shows its tail and can be scrolled back through
 /// this much of what came before; a command that writes more than this has
-/// said what it needed to say long before the end. The lines are kept as plain
-/// text, so a pane full of them is a few hundred kilobytes at most for the
-/// usual line length.
+/// said what it needed to say long before the end.
 const PANE_HISTORY: usize = 2_000;
 const MERGED_HISTORY: usize = 5_000;
+/// Bytes kept per pane, and in the merged log. The line count alone bounds
+/// nothing much: a line can be 64 KiB (`process::MAX_LINE_BYTES`), and a
+/// command writing such lines would hold on to a hundred megabytes and more.
+/// At the usual line length the count is what cuts first.
+const PANE_BYTES: usize = 4 * 1024 * 1024;
+const MERGED_BYTES: usize = 8 * 1024 * 1024;
 /// Lines one notch of the mouse wheel scrolls.
 const WHEEL_LINES: isize = 3;
 /// A pane with fewer log rows than this shows too little to follow; below it,
@@ -94,7 +98,14 @@ pub enum Nav {
 /// A pane's log and where the view of it is: at the tail, or held at a line.
 struct Log {
     lines: VecDeque<String>,
+    /// Lines kept at most.
     capacity: usize,
+    /// Bytes kept at most, over all the lines; the oldest go when a new line
+    /// would take the log past this. A line longer than the whole budget is
+    /// kept on its own.
+    budget: usize,
+    /// The bytes of the lines kept.
+    bytes: usize,
     /// The index of the first line in view while the view is scrolled back;
     /// `None` follows the tail. An index rather than a distance from the tail,
     /// so that lines arriving below do not move what is being read.
@@ -102,17 +113,23 @@ struct Log {
 }
 
 impl Log {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, budget: usize) -> Self {
         Self {
             lines: VecDeque::new(),
             capacity,
+            budget,
+            bytes: 0,
             top: None,
         }
     }
 
     fn push(&mut self, line: String) {
-        if self.lines.len() == self.capacity {
-            self.lines.pop_front();
+        while !self.lines.is_empty()
+            && (self.lines.len() == self.capacity || self.bytes + line.len() > self.budget)
+        {
+            if let Some(oldest) = self.lines.pop_front() {
+                self.bytes -= oldest.len();
+            }
             // The lines moved up by one; the view stays on the same ones until
             // the oldest kept line is the one in view, which then goes the way
             // of the ones before it.
@@ -120,6 +137,7 @@ impl Log {
                 self.top = Some(top.saturating_sub(1));
             }
         }
+        self.bytes += line.len();
         self.lines.push_back(line);
     }
 
@@ -250,7 +268,7 @@ impl Screen {
             now: Instant::now(),
             panes: Vec::new(),
             active: 0,
-            merged: Log::new(MERGED_HISTORY),
+            merged: Log::new(MERGED_HISTORY, MERGED_BYTES),
             finished: Vec::new(),
             abort: Abort::None,
             all_done: false,
@@ -296,7 +314,7 @@ impl Screen {
                     .map(|_| Pane {
                         job: None,
                         state: PaneState::Waiting,
-                        log: Log::new(PANE_HISTORY),
+                        log: Log::new(PANE_HISTORY, PANE_BYTES),
                         close_at: None,
                         closed: false,
                     })
@@ -1310,6 +1328,42 @@ mod tests {
 
         // Assert
         assert_eq!(screen.panes[0].log.top, Some(0));
+    }
+
+    #[test]
+    fn a_log_drops_its_oldest_lines_to_stay_within_its_bytes() {
+        // Arrange: a budget of ten lines of 100 bytes, and a view held on the
+        // third line.
+        let mut log = Log::new(1_000, 1_000);
+        for index in 0..10 {
+            log.push(format!("{index:0>100}"));
+        }
+        log.top = Some(2);
+
+        // Act
+        log.push("x".repeat(250));
+
+        // Assert: three lines went for the one, and the view moved with them.
+        assert_eq!(log.lines.len(), 8);
+        assert_eq!(log.bytes, 950);
+        assert!(log.lines[0].starts_with("000"), "{}", log.lines[0]);
+        assert_eq!(log.top, Some(0));
+    }
+
+    #[test]
+    fn a_line_longer_than_the_whole_budget_is_kept_on_its_own() {
+        // Arrange
+        let mut log = Log::new(1_000, 100);
+        log.push("short".into());
+
+        // Act
+        log.push("x".repeat(300));
+        log.push("after".into());
+
+        // Assert: the long line went as soon as a line followed it.
+        assert_eq!(log.lines.len(), 1);
+        assert_eq!(log.lines[0], "after");
+        assert_eq!(log.bytes, 5);
     }
 
     #[test]

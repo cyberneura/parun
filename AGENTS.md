@@ -101,6 +101,9 @@ pty 経由で実画面を取れる。Python の `pty.fork()` で起動し、`TIO
   末尾まで戻ったら `None` に戻し、また追従する (`Log::scroll`)。キーが効くペインは `Screen::active`
   (worker 番号) で、閉じたペインが active なら開いている最初のペインに委ねる (`active_among`)。
   番号 `[n]` と `>` の印は開いているペインが 2 つ以上の時だけ出す。
+  履歴は行数 (`PANE_HISTORY` 2,000 / `MERGED_HISTORY` 5,000) に加えて**バイト数でも抑える**
+  (`PANE_BYTES` 4 MiB / `MERGED_BYTES` 8 MiB。Codex の指摘)。1 行は `MAX_LINE_BYTES` = 64 KiB まで
+  あり得るので、行数だけだと 1 ペインで 125 MiB 持てる。超えたら古い行から落とし、`top` も追従させる。
   **マウスホイールのために画面中は `EnableMouseCapture` を入れている** (`TerminalSession`)。
   これを入れると端末のドラッグ選択は Shift 併用になる (README に明記)。SIGHUP / SIGTERM の経路
   (`stop_commands_on_hangup`) でも `DisableMouseCapture` を出してから抜ける。
