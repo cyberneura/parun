@@ -2,6 +2,8 @@
 
 Runs shell commands in parallel, each in its own pane.
 
+Website: https://www.cyberneura.com/app/parun
+
 ```shell
 parun 'cargo build' 'npm test' 'ruff check .'
 ```
