@@ -1,134 +1,142 @@
-# parun 開発メモ
+# parun development notes
 
-シェルコマンドを並列実行し、端末ではワーカーごとのペインに出力の末尾を見せる Rust 製 CLI。
-仕様と使い方は README.md を参照。ここには開発上の判断と注意点だけを書く。
+A Rust CLI that runs shell commands in parallel and, on a terminal, shows the tail of the output in a pane per worker.
+See README.md for the specification and usage. Only development decisions and caveats are written here.
 
-[pullkit](https://github.com/cyberneura/pullkit) の `sync` 画面 (`sync_screen.rs`) と
-プロセス管理 (`pullkit-core` の spawn / シグナル / 後始末) を、git 固有の部分を外して
-単独コマンドにしたもの。設計上の約束の多くは pullkit から引き継いでいる。
+It takes the `sync` screen (`sync_screen.rs`) and the process management (spawn / signals / cleanup in
+`pullkit-core`) from [pullkit](https://github.com/cyberneura/pullkit), strips the git-specific parts, and
+turns them into a standalone command. Many of the design commitments are inherited from pullkit.
 
-## 言語の方針
+## Language policy
 
-public リポジトリなので、**README・コードコメント・UI 文字列・エラーメッセージはすべて英語**で書く。
-**この AGENTS.md だけは日本語**。エージェント向けの開発メモで、他リポジトリでも
-「ユーザー向け表示は英語、開発者向けドキュメントは日本語」で揃えているため。
+This is a public repository, so **the README, code comments, UI strings and error messages are all written in English**.
+**This AGENTS.md is in English too.** It is the development notes for agents, and developer documentation
+in the public repositories is kept in English as well.
 
-## 構成
+## Layout
 
-| パス | 内容 |
+| Path | Contents |
 |---|---|
-| `src/main.rs` | CLI 引数、コマンド一覧の収集 (引数 / `--file` / stdin)、plain 出力、Summary、終了コード |
-| `src/runner.rs` | `Job` / `Event` / `JobResult`。ワーカースレッドで回し、イベントを呼び出しスレッドへ流す |
-| `src/process.rs` | 1 コマンドの起動と行ストリーミング、プロセスグループの追跡、Ctrl-C 2 段階、後始末 |
-| `src/screen.rs` | ペイン画面。フレーム組み立て (`Screen::frame`) と描画・キー入力 (`run` / `watch`) |
-| `src/terminal.rs` | raw mode + alternate screen の出入り、SIGHUP / SIGTERM / SIGINT での後始末 |
-| `src/text.rs` | 端末セル幅の計測・切り詰め、エスケープシーケンスと制御文字の除去 |
+| `src/main.rs` | CLI arguments, collecting the command list (arguments / `--file` / stdin), plain output, Summary, exit code |
+| `src/runner.rs` | `Job` / `Event` / `JobResult`. Runs on worker threads and streams events to the calling thread |
+| `src/process.rs` | Launching one command and streaming its lines, tracking process groups, two-stage Ctrl-C, cleanup |
+| `src/screen.rs` | The pane screen. Frame assembly (`Screen::frame`) and drawing / key input (`run` / `watch`) |
+| `src/terminal.rs` | Entering and leaving raw mode + the alternate screen, cleanup on SIGHUP / SIGTERM / SIGINT |
+| `src/text.rs` | Measuring and truncating terminal cell width, stripping escape sequences and control characters |
 
-## 開発コマンド
+## Development commands
 
 ```bash
-cargo run -- 'sleep 1; echo a' 'echo b; exit 1'   # ペイン画面
-cargo run -- --plain 'echo a' 'echo b'              # 端末でも plain 出力
+cargo run -- 'sleep 1; echo a' 'echo b; exit 1'   # pane screen
+cargo run -- --plain 'echo a' 'echo b'              # plain output even on a terminal
 cargo test
 cargo clippy --all-targets --locked -- -D warnings
 cargo fmt --all
 ```
 
-`.j-menu.yaml` からデモ実行 / check / release を起動できる。
+The demo run / check / release can be launched from `.j-menu.yaml`.
 
-## 検証の方法
+## How to verify
 
-**E2E の前に必ず `cargo build` する。** `cargo test` / `cargo clippy` は `target/debug/parun` を
-再リンクしないので、修正後に build せず実バイナリを触ると旧挙動を見る。
+**Always run `cargo build` before E2E.** `cargo test` / `cargo clippy` do not relink `target/debug/parun`,
+so if you touch the real binary after a fix without building, you see the old behaviour.
 
-**PATH の `parun` は Homebrew の cask で、手元のビルドとは別物。** 検証は `./target/debug/parun` の
-ようにパスを指定して行う。
+**The `parun` on PATH is the Homebrew cask and is different from your local build.** Verify by giving the
+path explicitly, e.g. `./target/debug/parun`.
 
-### plain 出力
+### Plain output
 
-stdout をパイプにつなげば plain 経路になる (`./target/debug/parun ... | cat`)。stdin も端末でない
-ことが条件なので、Claude Code の Bash ツールから実行した時は何もしなくても plain になる。
+Connecting stdout to a pipe takes the plain path (`./target/debug/parun ... | cat`). stdin not being a
+terminal is also a condition, so when run from Claude Code's Bash tool it is plain without doing anything.
 
-### ペイン画面
+### Pane screen
 
-pty 経由で実画面を取れる。Python の `pty.fork()` で起動し、`TIOCSWINSZ` でサイズを与え、
-出力からエスケープシーケンスを落として行を読む。「Enter quit」が出たら Enter を送る (ナビゲーションのキーでは抜けない)。Ctrl-C は
-`\x03` を書けば raw mode のキー入力として届く。中断の検証では、終了後に `pgrep -fl "^sleep 30"`
-で子が残っていないことまで見る。
+You can capture the real screen through a pty. Launch it with Python's `pty.fork()`, give it a size with
+`TIOCSWINSZ`, strip escape sequences from the output, and read the lines. When "Enter quit" appears, send Enter (navigation keys do not exit). Ctrl-C
+arrives as raw-mode key input if you write `\x03`. When verifying interruption, go as far as checking with
+`pgrep -fl "^sleep 30"` after exit that no children are left.
 
-## 設計上の約束
+## Design commitments
 
-- **コマンドは常に自分のプロセスグループで走らせ、`RUNNING_COMMANDS` に登録する**。pullkit は plain
-  経路だけ共有グループにして端末の Ctrl-C を直接届けていたが、parun は `kill <pid>`、Docker の PID 1、
-  `parun ... | tee` のようにシグナルが parun の pid にしか来ない場所で使われる。そこで子が残らないよう、
-  plain 経路でもシグナルスレッドが `stop_running_commands` で止める (レビュー指摘で変更)。
-  raw mode の画面では Ctrl-C はシグナルにならずキー入力になるので、画面側が
-  `interrupt_running_commands` (SIGINT) を送り、2 度目で `terminate_running_commands` (SIGKILL) を
-  送る。画面が自分の都合で抜ける時は `stop_running_commands` (SIGINT → 猶予 → SIGKILL)。
-- **端末が消えた時 (SIGHUP) と SIGTERM は自前で受けて `stop_running_commands` してから終わる**
-  (`terminal::stop_commands_on_hangup`)。自グループの子には端末の hangup が届かず、デフォルト動作で
-  parun だけが先に死ぬと丸ごと残る。stop の後は `exit()` ではなく同じシグナルで自分を殺す
-  (`emulate_default_handler`)。bash はスクリプトを止めるかを子が SIGINT で死んだかで判断するので、
-  `exit(130)` に戻すと plain 経路を呼ぶスクリプトが Ctrl-C で止まらなくなる。plain 経路の Ctrl-C は
-  端末から parun だけに届き (子は別グループ)、このスレッドが子へ転送する。
-- **中断 (`stop_running_commands`) と後始末 (`stop_leftover_commands`) は分ける**。前者は
-  `ABANDONED` を立てるので、そのプロセスではもう run を始められない。run が終わった後にコマンドが
-  残したプロセスを止めるのは後者。
-- **`ABANDONED` は立てたら戻さない**。中断は必ずプロセス終了で終わる前提で、run の開始時に戻すと
-  遅れて動き出したワーカースレッドが直前の中断を打ち消す。
-- **プロセスグループは中身が残っている間 `RUNNING_COMMANDS` に残し、シグナルを送る前に空になった
-  ものを外す**。コマンドが終わってもグループに中身が残っていれば `LEFTOVER_GROUPS` に移す。
-  空になったグループの id は別プロセスに再利用されうるので、`killpg(pgid, 0)` で確かめてから送る。
-  シグナルは `kill` バイナリではなく libc で送り、リストの Mutex は送る前に離す。
-- **spawn から登録までは `SPAWNING` で数え、stop はそれが 0 になるまで待つ。** 登録前に来た中断は
-  登録直後に自分で kill して答える。
-- **パイプの行長 (`MAX_LINE_BYTES`) とチャネル (`PIPE_QUEUE` / `EVENT_QUEUE`) は有界**。改行の無い
-  出力や描画が追いつかない UI でメモリが伸びないように、溢れたら子プロセスの write を待たせる。
-- **出力は行単位でストリームする**。`run_jobs` はワーカー数ぶんのスレッドで回し、イベントは
-  呼び出しスレッドで `on_event` に渡す (描画は 1 スレッドで済む)。まとめて出すとペインが
-  長いビルドの間ずっと空のままになる。
-- **ペインに入れる行はエスケープシーケンスと制御文字を落とす** (`text::plain_text`)。色やカーソル
-  移動はペインの中では再現できず、幅計算も狂う。タブはタブストップまでのスペースに置き換える。
-  plain 経路はそのまま流す (端末が解釈できる)。
-- **桁を数える時は文字数ではなく端末のセル数を使う**。`display_width` / `truncate_to_width` /
-  `pad_to_width` を使い、`chars().count()` や `{:<20}` で幅を扱わない。切り詰めは書記素クラスタ境界で
-  行い、絵文字を途中で割らない。
-- **フレームの最終行だけ幅いっぱいまで埋めない**。右下隅に文字を置くとスクロールする端末がある。
-- **ペインのスクロールバック (CYBERNEURA-DEV-1109)**: 各ペインと merged log は `Log` (有界の
-  `VecDeque` + `top: Option<usize>`) で、`top` が `None` なら末尾を追う。スクロール位置は
-  「末尾からの距離」ではなく**先頭からの行番号**で持つ — 距離で持つと、読んでいる最中に新しい行が
-  来るたびに表示が流れる。履歴が溢れて `pop_front` した時は `top` を 1 減らして同じ行を見せ続ける。
-  末尾まで戻ったら `None` に戻し、また追従する (`Log::scroll`)。キーが効くペインは `Screen::active`
-  (worker 番号) で、閉じたペインが active なら開いている最初のペインに委ねる (`active_among`)。
-  番号 `[n]` と `>` の印は開いているペインが 2 つ以上の時だけ出す。
-  履歴は行数 (`PANE_HISTORY` 2,000 / `MERGED_HISTORY` 5,000) に加えて**バイト数でも抑える**
-  (`PANE_BYTES` 4 MiB / `MERGED_BYTES` 8 MiB。Codex の指摘)。1 行は `MAX_LINE_BYTES` = 64 KiB まで
-  あり得るので、行数だけだと 1 ペインで 125 MiB 持てる。超えたら古い行から落とし、`top` も追従させる。
-  **マウスホイールのために画面中は `EnableMouseCapture` を入れている** (`TerminalSession`)。
-  これを入れると端末のドラッグ選択は Shift 併用になる (README に明記)。SIGHUP / SIGTERM の経路
-  (`stop_commands_on_hangup`) でも `DisableMouseCapture` を出してから抜ける。
-  全コマンド終了後は、ナビゲーションのキー (`navigation_for` が `Some` を返すもの) は画面を抜けず、
-  それ以外のキーで抜ける。「press any key」ではなく「Enter quit」と出しているのはそのため。
-- **コマンドは `sh -c` で起動する**。`make` / `xargs` / `find -exec` と同じ慣習で、`$SHELL` は
-  使わない (fish 等で構文が変わる)。stdin は `null`。
-- **plain 経路の `print_line` は書けなくなったら子を止めて即終了する**。`head` のように読み手が先に
-  閉じた時、`println!` は panic し、その panic は全ワーカーの終了を待ってしまう。
+- **Always run commands in their own process group and register them in `RUNNING_COMMANDS`**. pullkit put
+  only the plain path in a shared group so the terminal's Ctrl-C reached it directly, but parun is used in
+  places where signals arrive only at parun's pid, such as `kill <pid>`, PID 1 in Docker, and
+  `parun ... | tee`. So that no children are left there, the signal thread stops them with
+  `stop_running_commands` even on the plain path (changed after a review comment).
+  On the raw-mode screen Ctrl-C does not become a signal but key input, so the screen sends
+  `interrupt_running_commands` (SIGINT), and on the second press sends `terminate_running_commands` (SIGKILL).
+  When the screen exits for its own reasons it uses `stop_running_commands` (SIGINT → grace period → SIGKILL).
+- **When the terminal disappears (SIGHUP) and on SIGTERM, catch the signal ourselves, run `stop_running_commands`, and then exit**
+  (`terminal::stop_commands_on_hangup`). The terminal hangup does not reach children in their own groups, and if
+  only parun dies first with the default action, everything is left behind. After stopping, kill ourselves with
+  the same signal rather than calling `exit()` (`emulate_default_handler`). bash decides whether to stop a script
+  based on whether the child died from SIGINT, so going back to `exit(130)` would make scripts that call the plain
+  path not stop on Ctrl-C. On the plain path Ctrl-C from the terminal reaches only parun (children are in other
+  groups), and this thread forwards it to the children.
+- **Keep interruption (`stop_running_commands`) and cleanup (`stop_leftover_commands`) separate**. The former
+  sets `ABANDONED`, so that process can no longer start a run. Stopping processes a command left behind after
+  the run has finished is the job of the latter.
+- **Once `ABANDONED` is set, never reset it**. Interruption is assumed to always end with the process exiting;
+  resetting it at the start of a run would let a worker thread that started late cancel the preceding interruption.
+- **Keep a process group in `RUNNING_COMMANDS` while it still has members, and remove ones that have become
+  empty before sending a signal**. If the group still has members after the command finishes, move it to
+  `LEFTOVER_GROUPS`. The id of an empty group can be reused by another process, so check with
+  `killpg(pgid, 0)` before sending. Send signals via libc rather than the `kill` binary, and release the
+  list's Mutex before sending.
+- **Count from spawn to registration in `SPAWNING`, and have stop wait until it reaches 0.** An interruption
+  that arrives before registration is answered by the spawner killing the process itself right after registering.
+- **The pipe line length (`MAX_LINE_BYTES`) and the channels (`PIPE_QUEUE` / `EVENT_QUEUE`) are bounded**. So
+  that memory does not grow with output that has no newlines or with a UI whose drawing cannot keep up, when
+  they overflow the child process's write is made to wait.
+- **Stream output line by line**. `run_jobs` runs on as many threads as there are workers, and events are
+  passed to `on_event` on the calling thread (so drawing needs only one thread). Emitting output in bulk
+  leaves a pane empty for the whole duration of a long build.
+- **Strip escape sequences and control characters from lines put into a pane** (`text::plain_text`). Colours
+  and cursor movement cannot be reproduced inside a pane, and they break the width calculation. Tabs are
+  replaced with spaces up to the tab stop. The plain path passes output through as is (the terminal can
+  interpret it).
+- **When counting columns, use terminal cells, not character counts**. Use `display_width` / `truncate_to_width` /
+  `pad_to_width`; do not handle width with `chars().count()` or `{:<20}`. Truncate at grapheme cluster
+  boundaries and do not split emoji in the middle.
+- **Do not fill only the last line of the frame to the full width**. Some terminals scroll when a character is
+  placed in the bottom-right corner.
+- **Pane scrollback (CYBERNEURA-DEV-1109)**: each pane and the merged log are a `Log` (a bounded
+  `VecDeque` + `top: Option<usize>`); when `top` is `None` it follows the tail. The scroll position is held
+  **as a line number from the start**, not as "distance from the end" — holding a distance makes the view
+  drift every time a new line arrives while you are reading. When the history overflows and `pop_front` runs,
+  decrement `top` by 1 so the same line stays in view. When the view returns to the end, set it back to
+  `None` and follow again (`Log::scroll`). The pane that keys act on is `Screen::active`
+  (a worker number); if the active pane is closed, it defers to the first open pane (`active_among`).
+  The number `[n]` and the `>` marker are shown only when two or more panes are open.
+  History is bounded by line count (`PANE_HISTORY` 2,000 / `MERGED_HISTORY` 5,000) and **also by byte count**
+  (`PANE_BYTES` 4 MiB / `MERGED_BYTES` 8 MiB; pointed out by Codex). A single line can be up to
+  `MAX_LINE_BYTES` = 64 KiB, so with a line count alone one pane could hold 125 MiB. When exceeded, drop the
+  oldest lines and keep `top` in step.
+  **`EnableMouseCapture` is on while the screen is shown, for the mouse wheel** (`TerminalSession`).
+  With it on, drag selection in the terminal requires Shift (stated in the README). The SIGHUP / SIGTERM path
+  (`stop_commands_on_hangup`) also emits `DisableMouseCapture` before exiting.
+  After all commands have finished, navigation keys (those for which `navigation_for` returns `Some`) do not
+  leave the screen; any other key does. That is why it says "Enter quit" rather than "press any key".
+- **Launch commands with `sh -c`**. This is the same convention as `make` / `xargs` / `find -exec`; `$SHELL` is
+  not used (the syntax changes with fish and the like). stdin is `null`.
+- **`print_line` on the plain path stops the children and exits immediately once it can no longer write**. When the
+  reader closes first, as with `head`, `println!` panics, and that panic ends up waiting for all workers to finish.
 
-## リリース
+## Release
 
-`main` の `Cargo.toml` の version を変えて push するとリリースされる (`.github/workflows/release.yml`)。
-`plan` ジョブが「その version の Release が公開済みか」を releases API に訊き、404 の時だけ
-test → build → release へ進む。判定は diff ではなく状態なので、失敗した run は原因を直して
-push すれば続きから走る。構成は `cyberneura/runandlog` と同じ (`release-rust-cli` スキル参照)。
+Changing the version in `Cargo.toml` on `main` and pushing triggers a release (`.github/workflows/release.yml`).
+The `plan` job asks the releases API "has a Release for this version been published?", and only on 404 does it
+proceed to test → build → release. The decision is based on state, not on a diff, so a failed run continues
+from where it left off once you fix the cause and push. The setup is the same as `cyberneura/runandlog` (see the `release-rust-cli` skill).
 
-- 採番と push は `scripts/release.sh [patch|minor|major]` (既定 minor)。
-- build は macOS arm64 (Developer ID 署名 + notarytool 公証) と Linux x86_64。
-- 署名の Secrets (APPLE_*) は `~/home-files/sh/github-secret/deploy-github-secret-apple-building.sh`
-  の `repos` に `cyberneura/parun` を入れて実行すると 1Password から配られる。欠けていると build が
-  最初のステップで落ちる (黙って未署名で出さない)。
-- crates.io への publish はリポジトリ変数 `PUBLISH_CRATES=true` と secret `CARGO_REGISTRY_TOKEN` が
-  揃った時だけ走る。
-- Homebrew は `cyberneura/homebrew-tap` の `Casks/parun.rb`。tap 側の `scripts/update.py` が毎時
-  latest release を見て version / url / sha256 を書き換えるので、このリポジトリから tap へ push しない。
-- `test.yml` は PR でも走る (fmt / clippy -D warnings / test)。release からは `workflow_call` で
-  同じ定義を呼ぶ。コンパイラは `rust-toolchain.toml` で固定してある。
+- Numbering and pushing are done by `scripts/release.sh [patch|minor|major]` (default minor).
+- build is macOS arm64 (Developer ID signing + notarytool notarization) and Linux x86_64.
+- The signing Secrets (APPLE_*) are distributed from 1Password by adding `cyberneura/parun` to `repos` in
+  `~/home-files/sh/github-secret/deploy-github-secret-apple-building.sh` and running it. If they are missing,
+  build fails at the first step (it does not silently ship unsigned).
+- Publishing to crates.io runs only when both the repository variable `PUBLISH_CRATES=true` and the secret
+  `CARGO_REGISTRY_TOKEN` are present.
+- Homebrew is `Casks/parun.rb` in `cyberneura/homebrew-tap`. The tap's `scripts/update.py` checks the latest
+  release every hour and rewrites version / url / sha256, so do not push to the tap from this repository.
+- `test.yml` also runs on PRs (fmt / clippy -D warnings / test). release calls the same definition via
+  `workflow_call`. The compiler is pinned by `rust-toolchain.toml`.
